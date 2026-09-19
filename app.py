@@ -354,9 +354,25 @@ def renew_service(page):
                 log(f"❌ 点击尝试出错: {e}")
 
         if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+            log("❌ 错误：3次尝试后，续费弹窗仍未出现。")
             page.screenshot(path="renew_modal_failed.png")
-            return False
+
+            # 连续3次失败：10分钟后重新执行
+            bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            retry_time = bj_now + datetime.timedelta(minutes=10)
+            log(
+                f"⏰ 连续3次续费尝试失败，Cron 将在10分钟后重试："
+                f"{retry_time.strftime('%Y-%m-%d %H:%M')}（北京时间）"
+            )
+            update_cronjob_schedule(retry_time)
+
+            # 立即推送 Telegram
+            send_telegram_notification(
+                "❌ 续期失败：连续3次尝试均未打开续费弹窗，已安排10分钟后重试",
+                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知"),
+                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知")
+            )
+            return "RETRY_10M"
 
         handle_cloudflare(page)
         log("🖱️ 点击 'Create Invoice'...")
@@ -448,10 +464,21 @@ def main():
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
 
+            # 保存当前 Due Date，供连续3次失败时的TG通知使用
+            global _CURRENT_OLD_DUE
+            _CURRENT_OLD_DUE = old_due
+
             # 执行续费
             renew_result = renew_service(page)
 
             new_due = old_due
+            if renew_result == "RETRY_10M":
+                # renew_service() 已经完成：
+                # 1. Cron 写回10分钟后
+                # 2. Telegram 推送
+                log("🔁 已安排10分钟后重试，本次任务正常结束")
+                sys.exit(0)
+
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
                 status = "⏳ 未到续期时间"
