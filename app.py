@@ -335,10 +335,13 @@ def renew_service(page, server_id=None):
 
         modal_opened = False
 
+        # Renew 弹窗可能打开较慢。
+        # 不再因为 5 秒内没有出现弹窗就刷新页面，避免把正在加载的弹窗打断。
+        # 总等待时间保持在 10 次尝试范围内，但始终使用当前页面。
         for i in range(10):
             try:
-                # 每次尝试前重新确认页面状态
                 handle_cloudflare(page)
+
                 renew_btn = page.locator('button:has-text("Renew")').first
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
@@ -346,41 +349,84 @@ def renew_service(page, server_id=None):
 
                 log(f"🖱️ 第 {i + 1} 次尝试点击 'Renew'...")
 
-                # 使用 force click，避免遮挡/可点击区域问题
                 renew_btn.click(force=True)
 
-                # 等待 Modal / Create Invoice
-                log("🖲️ 等待续费弹窗...")
-                try:
-                    create_btn = page.locator('button:has-text("Create Invoice")').first
-                    create_btn.wait_for(state="visible", timeout=5000)
+                # 点击后持续等待当前页面上的 Create Invoice。
+                # 不刷新页面，最多等待 20 秒。
+                log("🖲️ 等待续费弹窗（不刷新页面）...")
+
+                create_btn = page.locator(
+                    'button:has-text("Create Invoice"):visible'
+                ).first
+
+                modal_wait_start = time.time()
+                modal_found = False
+
+                while time.time() - modal_wait_start < 20:
+                    # 如果 CF 在弹窗加载过程中出现，处理后继续等待
+                    if page.locator(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    ).count() > 0:
+                        log("⚠️ 等待续费弹窗期间检测到 Cloudflare，尝试处理...")
+                        handle_cloudflare(page)
+
+                    # Create Invoice 出现，说明弹窗已经打开
+                    if create_btn.count() > 0:
+                        try:
+                            if create_btn.is_visible():
+                                modal_found = True
+                                break
+                        except Exception:
+                            pass
+
+                    # 通过页面文字再次确认是否进入了续费弹窗
+                    try:
+                        current_text = page.locator("body").inner_text(timeout=2000)
+
+                        if (
+                            "Renewal Restricted" in current_text
+                            or "can only renew" in current_text.lower()
+                        ):
+                            log("⚠️ 未到续期时间，无法续期。")
+                            return "NOT_TIME"
+
+                    except Exception:
+                        pass
+
+                    time.sleep(1)
+
+                if modal_found:
                     modal_opened = True
                     log("✅ 续费弹窗已成功弹出！")
                     break
+
+                # 20 秒仍未出现，不刷新页面。
+                # 重新确认 Renew 按钮是否仍然存在；如果存在，再次点击。
+                log("⚠️ 20秒内弹窗仍未出现，不刷新页面，继续检查 Renew...")
+
+                try:
+                    current_renew = page.locator(
+                        'button:has-text("Renew"):visible'
+                    ).first
+
+                    if current_renew.count() > 0 and current_renew.is_visible():
+                        log("🔄 Renew 按钮仍然存在，再次点击...")
+                        continue
+
                 except Exception:
-                    # 再检查一次页面文字，避免把 Renewal Restricted 当成普通点击失败
-                    current_text = page.locator("body").inner_text()
-                    if "Renewal Restricted" in current_text or "can only renew" in current_text.lower():
-                        log("⚠️ 未到续期时间，无法续期。")
-                        return "NOT_TIME"
+                    pass
 
-                    log("⚠️ 弹窗未出现，准备重新加载页面后重试...")
-
-                    # 第1、2次失败时重新进入服务页面，再进行下一次点击
-                    if i < 9:
-                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-                        handle_cloudflare(page)
-                        page.wait_for_timeout(1500)
+                # Renew 暂时不可见时，也不刷新，等待页面自身完成加载
+                log("⏳ Renew 暂时不可见，等待页面继续加载...")
+                page.wait_for_timeout(3000)
 
             except Exception as e:
                 log(f"❌ 第 {i + 1} 次点击 Renew 出错: {e}")
+
+                # 出错后也不刷新页面，等待当前页面恢复
                 if i < 9:
-                    try:
-                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-                        handle_cloudflare(page)
-                        page.wait_for_timeout(1500)
-                    except Exception as reload_error:
-                        log(f"⚠️ 重载续费页面失败: {reload_error}")
+                    log("⏳ 不刷新页面，等待当前页面恢复后重试...")
+                    page.wait_for_timeout(3000)
 
         if not modal_opened:
             log("❌ 错误：10次尝试后，续费弹窗仍未出现。")
