@@ -380,6 +380,137 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
+
+def diagnose_turnstile(page, label=""):
+    """诊断 Turnstile 初始化状态；不写入、不伪造 token。"""
+    prefix = f" [{label}]" if label else ""
+    result = {
+        "iframe": -1,
+        "response_count": 0,
+        "token_lengths": [],
+        "container_count": 0,
+        "sitekey_count": 0,
+        "api_loaded": False,
+        "turnstile_type": "unknown",
+    }
+
+    try:
+        result["iframe"] = page.locator(
+            'iframe[src*="challenges.cloudflare.com"]'
+        ).count()
+    except Exception:
+        pass
+
+    try:
+        loc = page.locator(
+            'input[name="cf-turnstile-response"], '
+            'textarea[name="cf-turnstile-response"]'
+        )
+        result["response_count"] = loc.count()
+        for i in range(result["response_count"]):
+            try:
+                result["token_lengths"].append(
+                    len(loc.nth(i).input_value(timeout=500) or "")
+                )
+            except Exception:
+                result["token_lengths"].append(-1)
+    except Exception:
+        pass
+
+    try:
+        result["container_count"] = page.locator(
+            ".cf-turnstile, [class*='cf-turnstile'], "
+            "[data-sitekey]"
+        ).count()
+    except Exception:
+        pass
+
+    try:
+        result["sitekey_count"] = page.locator("[data-sitekey]").count()
+    except Exception:
+        pass
+
+    try:
+        result["api_loaded"] = bool(page.evaluate(
+            """() => !!(
+                window.turnstile &&
+                typeof window.turnstile === 'object'
+            )"""
+        ))
+        result["turnstile_type"] = str(page.evaluate(
+            """() => window.turnstile
+                ? typeof window.turnstile
+                : 'undefined'"""
+        ))
+    except Exception:
+        pass
+
+    log(
+        f"🧪 Turnstile诊断{prefix}: "
+        f"iframe={result['iframe']}, "
+        f"response字段={result['response_count']}, "
+        f"token长度={result['token_lengths']}, "
+        f"容器={result['container_count']}, "
+        f"sitekey={result['sitekey_count']}, "
+        f"api={result['api_loaded']}({result['turnstile_type']})"
+    )
+
+    return result
+
+
+def wait_for_turnstile_ready(page, max_wait=90):
+    """
+    等待 Turnstile 正常初始化/产生 response。
+    不主动调用 turnstile.execute，不写入 token，不绕过验证。
+    """
+    log(f"⏳ 等待 Turnstile 正常初始化，最长 {max_wait} 秒...")
+
+    start = time.time()
+    last_log = 0
+    stable_no_iframe = 0
+
+    while time.time() - start < max_wait:
+        state = diagnose_turnstile(page, "初始化等待")
+
+        # 已经产生非空 response，说明浏览器端已经有合法的验证结果。
+        if any(x > 0 for x in state["token_lengths"]):
+            log("✅ 检测到非空 cf-turnstile-response")
+            return True
+
+        # 有 Turnstile iframe，继续等待其正常完成。
+        if state["iframe"] > 0:
+            stable_no_iframe = 0
+            try:
+                handle_cloudflare(page)
+            except Exception:
+                pass
+        else:
+            stable_no_iframe += 1
+
+        # 如果 API 和容器都存在但 iframe 尚未出现，说明前端可能还在异步渲染。
+        if state["api_loaded"] and (
+            state["container_count"] > 0 or state["sitekey_count"] > 0
+        ):
+            if time.time() - last_log >= 10:
+                log("🔄 Turnstile API/容器已存在，但 iframe 尚未出现，继续等待前端初始化...")
+                last_log = time.time()
+
+        # 没有任何 Turnstile 痕迹时，不无限等待。
+        if stable_no_iframe >= 15 and not state["api_loaded"] and \
+                state["container_count"] == 0 and state["sitekey_count"] == 0:
+            log("⚠️ 连续约15秒未发现 Turnstile API、容器或 iframe")
+            break
+
+        time.sleep(2)
+
+    final = diagnose_turnstile(page, "初始化超时")
+    if any(x > 0 for x in final["token_lengths"]):
+        return True
+
+    log("❌ Turnstile 在限定时间内没有产生非空 response")
+    return False
+
+
 def renew_service(page, server_id=None):
     renew_request_seen = False
     renew_response_seen = False
@@ -513,8 +644,31 @@ def renew_service(page, server_id=None):
             )
             return "RETRY_10M"
 
-        # 在提交前检查一次 Turnstile 状态。
-        inspect_turnstile(page, "Create Invoice前")
+        # 在提交前详细检查 Turnstile。
+        before_ts = diagnose_turnstile(page, "Create Invoice前")
+
+        # 如果已经有非空 token，直接进入正常点击。
+        token_ready = any(x > 0 for x in before_ts["token_lengths"])
+
+        # 如果没有 token，等待页面自己的 Turnstile 正常初始化。
+        if not token_ready:
+            token_ready = wait_for_turnstile_ready(page, max_wait=90)
+
+        # 再检查一次，确保不是误判。
+        final_ts = diagnose_turnstile(page, "Create Invoice点击前")
+        token_ready = any(x > 0 for x in final_ts["token_lengths"])
+
+        if not token_ready:
+            log("❌ Create Invoice 前 Turnstile response 仍为空")
+            log("❌ 为避免再次提交空 cf-turnstile-response，本次不提交续期表单")
+            page.screenshot(path="turnstile_not_ready.png")
+            try:
+                with open("turnstile_not_ready.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                log("💾 已保存 Turnstile 异常页面: turnstile_not_ready.html")
+            except Exception:
+                pass
+            return False
 
         create_btn = page.locator('button:has-text("Create Invoice"):visible').first
         create_btn.wait_for(state="visible", timeout=15000)
@@ -522,10 +676,10 @@ def renew_service(page, server_id=None):
         page.wait_for_timeout(1000)
 
         # 只进行一次正常浏览器点击；不直接构造/提交 form。
-        log("🖱️ 点击 'Create Invoice'（仅提交一次）...")
+        log("🖱️ 点击 'Create Invoice'（Turnstile 已有 response，仅提交一次）...")
         create_btn.click(force=True)
 
-        # 给前端事件和 Turnstile 一点时间，然后持续观察网络状态。
+        # 持续观察网络状态。
         log("⏳ 等待 /renew 网络请求及后续跳转，最长 150 秒...")
         start_wait = time.time()
         last_status = None
@@ -580,7 +734,19 @@ def renew_service(page, server_id=None):
                 f"location={renew_response_location or '无'}, "
                 f"url={page.url}"
             )
-            inspect_turnstile(page, "续期失败最终状态")
+            diagnose_turnstile(page, "续期失败最终状态")
+
+            if renew_request_data and "cf-turnstile-response=" in renew_request_data:
+                try:
+                    ts_part = renew_request_data.split(
+                        "cf-turnstile-response=", 1
+                    )[1].split("&", 1)[0]
+                    if not ts_part:
+                        log("❌ 实际 POST 中 cf-turnstile-response 为空")
+                    else:
+                        log(f"ℹ️ 实际 POST 中 Turnstile 字段长度: {len(ts_part)}")
+                except Exception:
+                    pass
 
             # 输出安全的表单结构摘要，不输出 CSRF/token 内容。
             try:
