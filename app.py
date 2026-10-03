@@ -149,10 +149,10 @@ def update_github_cookie_secret(context):
         log("⚠️ 当前浏览器没有找到 remember_web Cookie，无法写回")
         return False
 
-    # 避免每次都把同一个值重新写入 GitHub Secret。
+    # 本次已经明确走账号密码登录，因此必须执行 GitHub Secret 写回。
+    # 即使值与旧值相同，也继续 PUT，不允许静默跳过。
     if COOKIE_VALUE and fresh_cookie == COOKIE_VALUE:
-        log("ℹ️ 登录后 Cookie 未发生变化，无需更新 GitHub Secret")
-        return True
+        log("⚠️ 密码登录后 Cookie 与旧值相同，仍强制写回 GitHub Secret")
 
     try:
         from nacl.public import PublicKey, SealedBox
@@ -335,6 +335,113 @@ def update_cron_job_after_success(success_time=None):
                 time.sleep(wait_sec)
 
     log("❌ cron-job.org 写回最终失败")
+    return False
+
+
+# =========================================================
+# 未到续期时间时的 Cron 写回
+# =========================================================
+def update_cron_job_before_due(due_date_str):
+    """未续期时也必须更新 cron-job.org。正常安排在 Due Date 前一天。"""
+    global CRON_NEXT_RUN_TEXT
+
+    api_key, job_id = parse_cron_job(CRON_JOB)
+    if not api_key or not job_id:
+        log("⚠️ 未配置 CRON_JOB，无法安排下一次续期")
+        return False
+
+    tz = ZoneInfo(CRON_TIMEZONE)
+    now = datetime.now(tz)
+
+    try:
+        due_date = datetime.strptime(due_date_str.strip(), "%d %b %Y").date()
+    except Exception as e:
+        log(f"❌ Due Date 无法解析，无法写回 Cron: {due_date_str!r} / {e}")
+        return False
+
+    target_date = due_date - timedelta(days=1)
+
+    if target_date > now.date():
+        hour = random.randint(17, 23)
+        minute = random.randint(0, 59)
+        next_run = datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, 0, tzinfo=tz
+        )
+    elif target_date == now.date():
+        # 已进入可续期日但本次仍未成功，10 分钟后重试。
+        next_run = (now + timedelta(minutes=10)).replace(second=0, microsecond=0)
+    else:
+        # 防止写入过去的时间。
+        next_run = (now + timedelta(minutes=10)).replace(second=0, microsecond=0)
+
+    expires_at = next_run + timedelta(hours=1)
+
+    payload = {
+        "job": {
+            "enabled": True,
+            "schedule": {
+                "timezone": CRON_TIMEZONE,
+                "expiresAt": int(expires_at.strftime("%Y%m%d%H%M%S")),
+                "hours": [next_run.hour],
+                "mdays": [next_run.day],
+                "minutes": [next_run.minute],
+                "months": [next_run.month],
+                "wdays": [-1]
+            }
+        }
+    }
+
+    url = f"{CRON_API_BASE}/jobs/{job_id}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "HidenCloud-Renew/1.0"
+    }
+
+    CRON_NEXT_RUN_TEXT = next_run.strftime("%Y-%m-%d %H:%M:%S") + f" ({CRON_TIMEZONE})"
+    log("⏰ 本次未续期，必须更新 cron-job.org")
+    log(f"📅 Due Date：{due_date_str}")
+    log(f"📅 下次运行：{CRON_NEXT_RUN_TEXT}")
+    log(f"🆔 Cron Job ID：{job_id}")
+
+    for attempt in range(1, 4):
+        try:
+            resp = requests.patch(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=20,
+                proxies=REQUESTS_PROXIES
+            )
+
+            if resp.status_code in (200, 204):
+                log("✅ 未续期场景的 cron-job.org 写回成功")
+                return True
+
+            body = _cron_response_text(resp)
+            log(f"⚠️ Cron 写回第{attempt}次失败：HTTP {resp.status_code}: {body}")
+
+            if attempt < 3:
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After", "")
+                    try:
+                        wait_sec = min(max(1, int(float(retry_after))), 60)
+                    except Exception:
+                        wait_sec = min(15 * attempt, 60)
+                else:
+                    wait_sec = min(15 * attempt, 60)
+                log(f"⏳ 等待 {wait_sec} 秒后重试...")
+                time.sleep(wait_sec)
+
+        except Exception as e:
+            log(f"⚠️ Cron 写回第{attempt}次异常：{e}")
+            if attempt < 3:
+                wait_sec = min(15 * attempt, 60)
+                log(f"⏳ 等待 {wait_sec} 秒后重试...")
+                time.sleep(wait_sec)
+
+    log("❌ 未续期场景的 cron-job.org 写回最终失败")
     return False
 
 
@@ -741,6 +848,14 @@ def login(page):
         return False
     log("💣 尝试账号密码登录...")
     try:
+        # Cookie 登录失效后，先删除旧 remember_web Cookie，
+        # 防止后续误把旧 Cookie 当成密码登录后获取的新 Cookie。
+        try:
+            page.context.clear_cookies(name=COOKIE_NAME)
+            log("🧹 已清除失效的旧 remember_web Cookie，准备获取新 Cookie")
+        except Exception as e:
+            log(f"⚠️ 清除旧 remember_web Cookie 失败: {e}")
+
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
 
         # --- 第一道 Turnstile：验证通过后才会显示账号密码输入框 ---
@@ -1040,7 +1155,12 @@ def main():
 
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
-                status = "⏳ 未到续期时间"
+                # 即使没有续期，也必须更新下一次 Cron。
+                cron_result = update_cron_job_before_due(old_due)
+                if cron_result is True:
+                    status = "⏳ 未到续期时间\n⏰ Cron 已更新"
+                else:
+                    status = "⏳ 未到续期时间\n❌ Cron 更新失败"
             elif renew_result is False:
                 log("❌ 续费失败，脚本退出。")
                 status = "❌ 续期失败"
@@ -1077,6 +1197,9 @@ def main():
             send_telegram_notification(status, old_due, new_due)
 
             if renew_result == "NOT_TIME":
+                # 未续期时，Cron 必须成功写回，否则本次 Actions 标红。
+                if cron_result is False:
+                    sys.exit(1)
                 sys.exit(0)
             elif renew_result is False:
                 sys.exit(1)
