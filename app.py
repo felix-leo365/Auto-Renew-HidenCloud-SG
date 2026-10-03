@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os,re,sys,time,random,requests,base64
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -17,6 +17,11 @@ PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，�
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
 CRON_JOB     = os.environ.get('CRON_JOB') or ""      # cron-job.org: API_KEY,JOB_ID
+GH_SECRET_TOKEN = os.environ.get('GH_SECRET_TOKEN') or ""  # GitHub PAT，用于自动更新 Actions Secret
+GITHUB_REPOSITORY = os.environ.get('GITHUB_REPOSITORY') or ""  # owner/repo，由 GitHub Actions 自动提供
+COOKIE_SECRET_NAME = 'COOKIE_VALUE'
+COOKIE_NAME = 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989'
+LOGIN_METHOD = ''
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -105,6 +110,107 @@ def send_telegram_notification(status, old_due, new_due):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
+# =========================================================
+# GitHub Actions Secret 自动刷新
+# Cookie 失效 -> 账号密码登录成功后，从浏览器当前 Cookie 中取出
+# remember_web_* 的最新值，并加密写回 GitHub Actions Secret COOKIE_VALUE。
+# 不在日志中输出 Cookie 原文。
+# =========================================================
+def get_fresh_remember_cookie(context):
+    """从当前浏览器会话获取最新 remember_web Cookie。"""
+    try:
+        cookies = context.cookies([BASE_URL])
+        for c in cookies:
+            if c.get('name') == COOKIE_NAME and c.get('value'):
+                return c.get('value')
+        # 兼容未来 Cookie 名称变化：只匹配 remember_web_ 前缀。
+        for c in cookies:
+            if str(c.get('name', '')).startswith('remember_web_') and c.get('value'):
+                return c.get('value')
+    except Exception as e:
+        log(f"⚠️ 获取最新 Cookie 失败: {e}")
+    return None
+
+
+def update_github_cookie_secret(context):
+    """把当前浏览器最新 remember_web Cookie 加密写回 GitHub Actions Secret。"""
+    if not GH_SECRET_TOKEN:
+        log("ℹ️ 未配置 GH_SECRET_TOKEN，跳过 GitHub Cookie 写回")
+        return False
+
+    repo = GITHUB_REPOSITORY.strip()
+    if not repo or '/' not in repo:
+        log("⚠️ GITHUB_REPOSITORY 未配置或格式错误，应为 owner/repo")
+        return False
+
+    fresh_cookie = get_fresh_remember_cookie(context)
+    if not fresh_cookie:
+        log("⚠️ 当前浏览器没有找到 remember_web Cookie，无法写回")
+        return False
+
+    # 避免每次都把同一个值重新写入 GitHub Secret。
+    if COOKIE_VALUE and fresh_cookie == COOKIE_VALUE:
+        log("ℹ️ 登录后 Cookie 未发生变化，无需更新 GitHub Secret")
+        return True
+
+    try:
+        from nacl.public import PublicKey, SealedBox
+    except ImportError:
+        log("❌ 缺少 PyNaCl：请在 Actions 中安装 pip install pynacl")
+        return False
+
+    owner, repo_name = repo.split('/', 1)
+    api = f"https://api.github.com/repos/{owner}/{repo_name}/actions/secrets"
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': f'Bearer {GH_SECRET_TOKEN}',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'HidenCloud-Renew/1.0'
+    }
+
+    try:
+        # 1. 获取仓库 Actions Secret 公钥
+        r = requests.get(f"{api}/public-key", headers=headers, timeout=20,
+                         proxies=REQUESTS_PROXIES)
+        if r.status_code != 200:
+            log(f"❌ GitHub 获取 Secret 公钥失败: HTTP {r.status_code}: {(r.text or '')[:300]}")
+            return False
+        key_data = r.json()
+        public_key = key_data.get('key')
+        key_id = key_data.get('key_id')
+        if not public_key or not key_id:
+            log("❌ GitHub 公钥响应缺少 key/key_id")
+            return False
+
+        # 2. 使用 GitHub 要求的 LibSodium sealed box 加密 Cookie
+        encrypted = SealedBox(PublicKey(base64.b64decode(public_key))).encrypt(
+            fresh_cookie.encode('utf-8')
+        )
+        encrypted_value = base64.b64encode(encrypted).decode('utf-8')
+
+        # 3. 覆盖仓库 Actions Secret COOKIE_VALUE
+        payload = {
+            'encrypted_value': encrypted_value,
+            'key_id': key_id
+        }
+        r = requests.put(
+            f"{api}/{COOKIE_SECRET_NAME}",
+            headers={**headers, 'Content-Type': 'application/json'},
+            json=payload,
+            timeout=20,
+            proxies=REQUESTS_PROXIES
+        )
+        if r.status_code in (201, 204):
+            log("✅ 已将登录后最新 Cookie 加密写回 GitHub Secret COOKIE_VALUE")
+            return True
+
+        log(f"❌ GitHub Cookie 写回失败: HTTP {r.status_code}: {(r.text or '')[:500]}")
+        return False
+    except Exception as e:
+        log(f"❌ GitHub Cookie 写回异常: {e}")
+        return False
+
 
 # =========================================================
 # cron-job.org 写回
@@ -602,6 +708,7 @@ def save_login_diagnostics(page, context, prefix='invoice_login_redirect'):
     except Exception as e: log(f"⚠️ 保存诊断失败: {e}")
 
 def login(page):
+    global LOGIN_METHOD
     # 1. Cookie 登录尝试
     if COOKIE_VALUE:
         log("📇 尝试 Cookie 登录...")
@@ -621,6 +728,7 @@ def login(page):
             page_title = page.title()
             log(f"📝 当前Title: {page_title}")
             if "auth/login" not in page.url:
+                LOGIN_METHOD = "cookie"
                 log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
             log("⚠️ Cookie 失效，切换到账号密码登录...")
@@ -704,6 +812,7 @@ def login(page):
             log("❌ 登录失败，账号密码错误或被封禁")
             page.screenshot(path="login_fail.png")
             return False
+        LOGIN_METHOD = "password"
         log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
         return True
     except Exception as e:
@@ -901,6 +1010,14 @@ def main():
 
             if not login(page):
                 sys.exit(1)
+
+            # 如果本次是账号密码登录，自动把新的 remember_web Cookie 写回 GitHub Secret。
+            # 即使本次后续续费失败，Cookie 也已经可以供下一次 Actions 使用。
+            if LOGIN_METHOD == "password":
+                log("🔄 检测到本次通过账号密码登录，准备刷新 GitHub Cookie Secret...")
+                update_github_cookie_secret(context)
+            else:
+                log("ℹ️ 本次使用现有 Cookie 登录，无需刷新 Cookie Secret")
 
             # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
