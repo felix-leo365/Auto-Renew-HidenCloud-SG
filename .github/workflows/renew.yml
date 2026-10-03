@@ -46,10 +46,10 @@ jobs:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
-          GH_SECRET_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CRON_JOB: ${{ secrets.CRON_JOB }}
+          GH_SECRET_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
