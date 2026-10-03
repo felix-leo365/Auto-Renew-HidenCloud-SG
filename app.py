@@ -72,14 +72,7 @@ def send_telegram_notification(status, old_due, new_due):
     # 获取运行时间
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_EMAIL = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_EMAIL = f"{name}@{domain}"
-    else:
-        masked_EMAIL = EMAIL[:2] + '****'
+    masked_EMAIL = EMAIL if EMAIL else "未配置"
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
@@ -407,6 +400,75 @@ def solve_turnstile(page, timeout=120, success_check=None,
         pass
     return False
 
+# ===== Invoice / Login session diagnostics =====
+_REQUEST_LOG = []
+_MAX_REQUEST_LOG = 250
+
+def _short_url(url, max_len=220):
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(url)
+        return f"{u.scheme}://{u.netloc}{u.path}"[:max_len]
+    except Exception:
+        return str(url)[:max_len]
+
+def _interesting_url(url):
+    u = (url or '').lower()
+    return any(k in u for k in ('/renew','/payment/','/invoice','/auth/login','/login','challenge-platform','challenges.cloudflare.com','/service/','csrf','logout'))
+
+def attach_network_debug(page):
+    def on_request(req):
+        try:
+            if not _interesting_url(req.url): return
+            rec={'kind':'REQ','ts':time.strftime('%H:%M:%S'),'method':req.method,'url':_short_url(req.url),'resource':req.resource_type}
+            _REQUEST_LOG.append(rec)
+            if len(_REQUEST_LOG)>_MAX_REQUEST_LOG: del _REQUEST_LOG[:-_MAX_REQUEST_LOG]
+            log(f"🌐 [REQ] {req.method} {req.resource_type} {_short_url(req.url)}")
+        except Exception: pass
+    def on_response(resp):
+        try:
+            if not _interesting_url(resp.url): return
+            location=(resp.headers or {}).get('location','')
+            rec={'kind':'RESP','ts':time.strftime('%H:%M:%S'),'status':resp.status,'url':_short_url(resp.url),'location':_short_url(location) if location else ''}
+            _REQUEST_LOG.append(rec)
+            if len(_REQUEST_LOG)>_MAX_REQUEST_LOG: del _REQUEST_LOG[:-_MAX_REQUEST_LOG]
+            if location:
+                log(f"🌐 [RESP] {resp.status} {_short_url(resp.url)} -> Location: {_short_url(location)}")
+            else:
+                log(f"🌐 [RESP] {resp.status} {_short_url(resp.url)}")
+        except Exception: pass
+    page.on('request',on_request)
+    page.on('response',on_response)
+
+def cookie_snapshot(context):
+    try:
+        cookies=context.cookies([BASE_URL])
+        return {c.get('name'):{k:c.get(k) for k in ('domain','path','httpOnly','secure','sameSite','expires')} for c in cookies}
+    except Exception as e:
+        log(f"⚠️ Cookie 快照失败: {e}")
+        return {}
+
+def log_cookie_diff(before, after, label='Cookie'):
+    b=set(before or {}); a=set(after or {})
+    added=sorted(a-b); removed=sorted(b-a)
+    changed=sorted(k for k in a&b if before.get(k)!=after.get(k))
+    log(f"🍪 {label}: 新增={added or '无'}, 删除={removed or '无'}, 属性变化={changed or '无'}")
+
+def save_login_diagnostics(page, context, prefix='invoice_login_redirect'):
+    try: page.screenshot(path=f'{prefix}.png', full_page=True)
+    except Exception: pass
+    try: Path(f'{prefix}.html').write_text(page.content(),encoding='utf-8')
+    except Exception: pass
+    try:
+        with open(f'{prefix}_network.txt','w',encoding='utf-8') as f:
+            f.write(f'URL: {page.url}\nTitle: {page.title()}\n')
+            f.write('--- interesting requests/responses ---\n')
+            for rec in _REQUEST_LOG[-150:]: f.write(repr(rec)+'\n')
+            f.write('--- cookies (names only) ---\n')
+            for name,meta in cookie_snapshot(context).items(): f.write(f'{name}: {meta}\n')
+        log(f"📦 已保存诊断: {prefix}.png / {prefix}.html / {prefix}_network.txt")
+    except Exception as e: log(f"⚠️ 保存诊断失败: {e}")
+
 def login(page):
     # 1. Cookie 登录尝试
     if COOKIE_VALUE:
@@ -567,7 +629,6 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
@@ -575,112 +636,97 @@ def renew_service(page):
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
 
         log("🖱️ 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
-
-        modal_opened = False
+        renew_btn=page.locator('button:has-text("Renew")')
+        create_btn=page.locator('button:has-text("Create Invoice")')
+        modal_opened=False
         for i in range(6):
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.wait_for(state="visible",timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
-
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                time.sleep(2)
-                page_text = page.locator("body").inner_text()
+                renew_btn.click(); time.sleep(2)
+                page_text=page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
-
+                    log("⚠️ 未到续期时间，无法续期。"); page.screenshot(path="renew_not_allowed.png"); return "NOT_TIME"
                 log("🖲️ 等待弹窗出现...")
                 try:
-                    create_btn.wait_for(state="visible", timeout=5000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
-                    break
-                except:
-                    # 弹窗可能先展示 Turnstile，创建按钮稍后才出现
-                    if challenge_boxes(page):
-                        modal_opened = True
-                        log("✅ 弹窗已弹出（先出现 Turnstile 验证）！")
-                        break
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
-            except Exception as e:
-                log(f"❌ 点击尝试出错: {e}")
-
+                    create_btn.wait_for(state="visible",timeout=5000); modal_opened=True; log("✅ 弹窗已成功弹出！"); break
+                except Exception:
+                    if challenge_boxes(page): modal_opened=True; log("✅ 弹窗已弹出（先出现 Turnstile 验证）！"); break
+                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试..."); time.sleep(2)
+            except Exception as e: log(f"❌ 点击尝试出错: {e}")
         if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
-            page.screenshot(path="renew_modal_failed.png")
-            return False
+            log("❌ 错误：尝试多次后，续费弹窗仍未出现。"); page.screenshot(path="renew_modal_failed.png"); return False
 
-        # --- 弹窗内的 Turnstile：处理完再点 Create Invoice ---
         log("🛡️ 处理弹窗内的 Turnstile...")
-        if not solve_turnstile(page, timeout=90, require_positive=True,
-                               shot_on_timeout="modal_turnstile_fail.png"):
-            log("⚠️ 弹窗内 Turnstile 未确认通过，仍尝试点击 'Create Invoice'...")
+        token_ok=solve_turnstile(page,timeout=90,require_positive=True,shot_on_timeout="modal_turnstile_fail.png")
+        st=turnstile_state(page); log(f"🔐 Create Invoice 前 Turnstile 状态: {st}")
+        if not token_ok or st['total']<=0 or st['solved']<st['total']:
+            log("❌ Create Invoice 前没有确认有效 Turnstile token，停止提交")
+            page.screenshot(path="create_invoice_blocked_no_token.png"); return False
+        try: create_btn.wait_for(state="visible",timeout=30000)
+        except Exception: pass
+        if not create_btn.is_visible():
+            log("❌ Create Invoice 按钮不可见"); page.screenshot(path="create_invoice_not_visible.png"); return False
 
-        # 等待 Create Invoice 按钮就绪并点击
+        before_url=page.url; before_cookies=cookie_snapshot(page.context)
+        log(f"📌 Create Invoice 前 URL: {before_url}"); log(f"📌 Create Invoice 前 Cookie 数量: {len(before_cookies)}")
+        log(f"📌 Create Invoice 前 Turnstile: {turnstile_state(page)}")
         try:
-            create_btn.wait_for(state="visible", timeout=30000)
-        except Exception:
-            pass
+            log("🖱️ 点击 'Create Invoice'（第 1 次）..."); create_btn.click(timeout=10000)
+        except Exception as e:
+            log(f"❌ 点击 'Create Invoice' 失败: {e}"); page.screenshot(path="create_invoice_failed.png"); return False
 
-        create_clicked = False
-        for i in range(3):
-            try:
-                log(f"🖱️ 点击 'Create Invoice'（第 {i+1} 次）...")
-                create_btn.click(timeout=8000)
-                create_clicked = True
-                break
-            except Exception as e:
-                log(f"⚠️ 点击 'Create Invoice' 失败: {e}")
-                # 可能 token 还没生效，再处理一次 Turnstile
-                solve_turnstile(page, timeout=30, require_positive=True)
-        if not create_clicked:
-            log("❌ 无法点击 'Create Invoice'。")
-            page.screenshot(path="create_invoice_failed.png")
-            return False
-
-        new_invoice_url = None
-        start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
-                break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, reload_after=8)
+        log("⏳ Create Invoice 已点击，观察后端响应/页面跳转（最长 120 秒）...")
+        start_wait=time.time(); last_url=page.url; last_cookie=time.time()
+        while time.time()-start_wait<120:
+            current=page.url
+            if current!=last_url:
+                log(f"🔀 页面 URL 变化: {last_url} -> {current}"); last_url=current
+            if "/payment/invoice/" in current:
+                log(f"🎉 已进入 Invoice 页面: {current}"); new_invoice_url=current; break
+            if "/auth/login" in current:
+                log("❌ Create Invoice 后被重定向到 Login！")
+                log_cookie_diff(before_cookies,cookie_snapshot(page.context),"Create Invoice 前后 Cookie")
+                save_login_diagnostics(page,page.context,"invoice_login_redirect")
+                return False
+            if time.time()-last_cookie>=3:
+                log_cookie_diff(before_cookies,cookie_snapshot(page.context),"Create Invoice Cookie"); last_cookie=time.time()
+            frames=challenge_frames(page)
+            if frames:
+                log(f"🛡️ Create Invoice 后检测到 {len(frames)} 个 Cloudflare challenge frame，正常处理...")
+                solve_turnstile(page,timeout=45,require_positive=True,shot_on_timeout="invoice_turnstile_fail.png")
             time.sleep(1)
+        else:
+            new_invoice_url=None
 
         if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
-            page.screenshot(path="renew_stuck_invoice.png")
+            log("❌ 120 秒内未进入 Invoice 页面")
+            log(f"🔎 最终 URL: {page.url}"); log(f"🔎 最终 Title: {page.title()!r}")
+            log_cookie_diff(before_cookies,cookie_snapshot(page.context),"最终 Cookie")
+            if "/auth/login" in page.url: save_login_diagnostics(page,page.context,"invoice_login_timeout")
+            else:
+                try:
+                    page.screenshot(path="renew_stuck_invoice.png",full_page=True); Path("renew_stuck_invoice.html").write_text(page.content(),encoding="utf-8")
+                except Exception: pass
             return False
 
-        if page.url != new_invoice_url:
-            page.goto(new_invoice_url)
-        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-
+        if page.url!=new_invoice_url: page.goto(new_invoice_url,wait_until="domcontentloaded",timeout=60000)
+        solve_turnstile(page,timeout=60,success_check=page_ready,reload_after=8)
         log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
-        log("✅ 'Pay' 按钮已点击。")
-
-        # 等待支付确认页面或跳转回服务页
+        pay_btn=page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        try:
+            pay_btn.wait_for(state="visible",timeout=30000); pay_btn.click(); log("✅ 'Pay' 按钮已点击。")
+        except Exception as e:
+            log(f"❌ Pay 按钮未找到/无法点击: {e}"); page.screenshot(path="pay_button_failed.png"); return False
         time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        page.goto(SERVICE_URL,wait_until="domcontentloaded",timeout=60000)
+        solve_turnstile(page,timeout=60,success_check=page_ready,reload_after=8)
         return True
-
     except Exception as e:
         log(f"❌ 续费异常: {e}")
-        page.screenshot(path="renew_error.png")
+        try: page.screenshot(path="renew_error.png",full_page=True)
+        except Exception: pass
         return False
 
 def main():
@@ -718,6 +764,8 @@ def main():
             )
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
+            attach_network_debug(page)
+            log("🔎 已启用 Create Invoice / Login 网络诊断")
 
             if not login(page):
                 sys.exit(1)
