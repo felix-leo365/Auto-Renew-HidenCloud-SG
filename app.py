@@ -458,56 +458,168 @@ def diagnose_turnstile(page, label=""):
     return result
 
 
+
+def inspect_turnstile_render_state(page, label=""):
+    """检查 Turnstile 容器是否真正进入渲染状态；不主动调用 render/execute。"""
+    prefix = f" [{label}]" if label else ""
+    try:
+        data = page.evaluate(
+            """() => {
+                const nodes = Array.from(document.querySelectorAll(
+                    '.cf-turnstile, [data-sitekey]'
+                ));
+                return nodes.map((el, i) => ({
+                    index: i,
+                    tag: el.tagName,
+                    id: el.id || '',
+                    className: el.className || '',
+                    sitekey: el.getAttribute('data-sitekey') || '',
+                    callback: el.getAttribute('data-callback') || '',
+                    errorCallback: el.getAttribute('data-error-callback') || '',
+                    expiredCallback: el.getAttribute('data-expired-callback') || '',
+                    action: el.getAttribute('data-action') || '',
+                    mode: el.getAttribute('data-mode') || '',
+                    size: el.getAttribute('data-size') || '',
+                    theme: el.getAttribute('data-theme') || '',
+                    childCount: el.children.length,
+                    innerLength: el.innerHTML.length,
+                    rect: (() => {
+                        const r = el.getBoundingClientRect();
+                        return {
+                            x: Math.round(r.x),
+                            y: Math.round(r.y),
+                            width: Math.round(r.width),
+                            height: Math.round(r.height)
+                        };
+                    })()
+                }));
+            }"""
+        )
+        log(f"🧩 Turnstile容器状态{prefix}: {json.dumps(data, ensure_ascii=False)}")
+        return data
+    except Exception as e:
+        log(f"⚠️ 读取 Turnstile 容器状态失败{prefix}: {e}")
+        return []
+
+
+def install_page_diagnostics(page):
+    """安装浏览器级诊断监听，重点观察 Turnstile 是否报错或加载失败。"""
+    def on_console(msg):
+        try:
+            txt = msg.text or ""
+            low = txt.lower()
+            if (
+                "turnstile" in low
+                or "cloudflare" in low
+                or "challenge" in low
+                or msg.type in ("error", "warning")
+            ):
+                log(f"🖥️ 浏览器 {msg.type}: {txt[:1000]}")
+        except Exception:
+            pass
+
+    def on_page_error(exc):
+        try:
+            log(f"💥 页面 JS 错误: {exc}")
+        except Exception:
+            pass
+
+    def on_request_failed(request):
+        try:
+            url = request.url
+            low = url.lower()
+            if (
+                "cloudflare" in low
+                or "turnstile" in low
+                or "challenge" in low
+            ):
+                log(f"❌ Turnstile/Cloudflare 请求失败: {url}")
+        except Exception:
+            pass
+
+    def on_response(response):
+        try:
+            url = response.url
+            low = url.lower()
+            if (
+                "cloudflare" in low
+                or "turnstile" in low
+                or "challenge" in low
+            ):
+                if response.status >= 400:
+                    log(
+                        f"❌ Turnstile/Cloudflare HTTP异常: "
+                        f"{response.status} {url}"
+                    )
+                elif "api.js" in low:
+                    log(
+                        f"📦 Turnstile api.js 响应: "
+                        f"{response.status} {url}"
+                    )
+        except Exception:
+            pass
+
+    page.on("console", on_console)
+    page.on("pageerror", on_page_error)
+    page.on("requestfailed", on_request_failed)
+    page.on("response", on_response)
+
+    return on_console, on_page_error, on_request_failed, on_response
+
+
 def wait_for_turnstile_ready(page, max_wait=90):
     """
-    等待 Turnstile 正常初始化/产生 response。
-    不主动调用 turnstile.execute，不写入 token，不绕过验证。
+    等待网站自己的 Turnstile 正常渲染并产生 response。
+    不主动调用 turnstile.render/execute，不写入 token。
     """
-    log(f"⏳ 等待 Turnstile 正常初始化，最长 {max_wait} 秒...")
+    log(f"⏳ 等待 Turnstile 正常渲染，最长 {max_wait} 秒...")
 
     start = time.time()
-    last_log = 0
-    stable_no_iframe = 0
+    last_state = None
+    last_detail = 0
 
     while time.time() - start < max_wait:
-        state = diagnose_turnstile(page, "初始化等待")
+        state = diagnose_turnstile(page, "渲染等待")
+        detail = inspect_turnstile_render_state(page, "渲染等待")
 
-        # 已经产生非空 response，说明浏览器端已经有合法的验证结果。
+        # 浏览器已经产生 response。
         if any(x > 0 for x in state["token_lengths"]):
             log("✅ 检测到非空 cf-turnstile-response")
             return True
 
-        # 有 Turnstile iframe，继续等待其正常完成。
-        if state["iframe"] > 0:
-            stable_no_iframe = 0
-            try:
-                handle_cloudflare(page)
-            except Exception:
-                pass
-        else:
-            stable_no_iframe += 1
+        # 重点：如果容器存在、API存在，但没有 iframe/子节点，
+        # 就继续观察 JS 是否真的在执行，而不是认为“验证很慢”。
+        if state["api_loaded"] and state["container_count"] > 0:
+            if time.time() - last_detail >= 10:
+                log(
+                    "🔄 Turnstile API + sitekey 容器均存在，"
+                    "但尚未生成 iframe；继续等待并收集前端状态..."
+                )
+                last_detail = time.time()
 
-        # 如果 API 和容器都存在但 iframe 尚未出现，说明前端可能还在异步渲染。
-        if state["api_loaded"] and (
-            state["container_count"] > 0 or state["sitekey_count"] > 0
-        ):
-            if time.time() - last_log >= 10:
-                log("🔄 Turnstile API/容器已存在，但 iframe 尚未出现，继续等待前端初始化...")
-                last_log = time.time()
+        # 页面状态发生变化时立即记录。
+        compact = (
+            state["iframe"],
+            state["response_count"],
+            tuple(state["token_lengths"]),
+            state["container_count"],
+            state["sitekey_count"],
+            state["api_loaded"],
+            json.dumps(detail, ensure_ascii=False, sort_keys=True)
+            if detail else ""
+        )
+        if compact != last_state:
+            last_state = compact
 
-        # 没有任何 Turnstile 痕迹时，不无限等待。
-        if stable_no_iframe >= 15 and not state["api_loaded"] and \
-                state["container_count"] == 0 and state["sitekey_count"] == 0:
-            log("⚠️ 连续约15秒未发现 Turnstile API、容器或 iframe")
-            break
+        time.sleep(3)
 
-        time.sleep(2)
+    final = diagnose_turnstile(page, "渲染超时")
+    inspect_turnstile_render_state(page, "渲染超时")
 
-    final = diagnose_turnstile(page, "初始化超时")
     if any(x > 0 for x in final["token_lengths"]):
         return True
 
-    log("❌ Turnstile 在限定时间内没有产生非空 response")
+    log("❌ Turnstile 未完成正常渲染，response 仍为空")
     return False
 
 
@@ -652,6 +764,7 @@ def renew_service(page, server_id=None):
 
         # 如果没有 token，等待页面自己的 Turnstile 正常初始化。
         if not token_ready:
+            inspect_turnstile_render_state(page, "首次初始化检查")
             token_ready = wait_for_turnstile_ready(page, max_wait=90)
 
         # 再检查一次，确保不是误判。
@@ -666,8 +779,19 @@ def renew_service(page, server_id=None):
                 with open("turnstile_not_ready.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
                 log("💾 已保存 Turnstile 异常页面: turnstile_not_ready.html")
-            except Exception:
-                pass
+
+                # 额外保存 Turnstile 容器的 outerHTML，便于直接比较网页实际结构。
+                snippet = page.evaluate(
+                    """() => Array.from(document.querySelectorAll(
+                        '.cf-turnstile, [data-sitekey]'
+                    )).map((e, i) => `<!-- TURNSTILE ${i} -->\\n${e.outerHTML}`)
+                    .join('\\n')"""
+                )
+                with open("turnstile_container.html", "w", encoding="utf-8") as f:
+                    f.write(snippet or "<!-- no turnstile container -->")
+                log("💾 已保存 Turnstile 容器: turnstile_container.html")
+            except Exception as e:
+                log(f"⚠️ 保存 Turnstile 诊断文件失败: {e}")
             return False
 
         create_btn = page.locator('button:has-text("Create Invoice"):visible').first
@@ -851,6 +975,7 @@ def main():
             )
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
+            install_page_diagnostics(page)
 
             if not login(page):
                 sys.exit(1)
