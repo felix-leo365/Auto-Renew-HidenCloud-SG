@@ -183,30 +183,97 @@ def schedule_next_run_before_due(due_date_str):
         bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
         update_cronjob_schedule(bj_now + datetime.timedelta(minutes=5))
 
+def inspect_turnstile(page, label=""):
+    """只检查 Turnstile 状态，不写入/伪造 token。"""
+    try:
+        iframe_count = page.locator('iframe[src*="challenges.cloudflare.com"]').count()
+    except Exception:
+        iframe_count = -1
+
+    token_count = 0
+    token_lengths = []
+    try:
+        token_loc = page.locator(
+            'input[name="cf-turnstile-response"], '
+            'textarea[name="cf-turnstile-response"]'
+        )
+        token_count = token_loc.count()
+        for i in range(token_count):
+            try:
+                value = token_loc.nth(i).input_value(timeout=1000)
+                token_lengths.append(len(value or ""))
+            except Exception:
+                token_lengths.append(-1)
+    except Exception:
+        pass
+
+    prefix = f" [{label}]" if label else ""
+    log(
+        f"🔎 Turnstile{prefix}: "
+        f"iframe={iframe_count}, response字段={token_count}, "
+        f"token长度={token_lengths}"
+    )
+    return iframe_count, token_lengths
+
+
 def handle_cloudflare(page):
+    """等待 Cloudflare/Turnstile 正常完成；不绕过验证。"""
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
     if page.locator(iframe_selector).count() == 0:
         return True
-    log("⚠️ 检测到 Cloudflare 验证...")
+
+    log("⚠️ 检测到 Cloudflare/Turnstile 验证...")
+    inspect_turnstile(page, "开始")
+
     start_time = time.time()
+    clicked = False
+
     while time.time() - start_time < 60:
-        if page.locator(iframe_selector).count() == 0:
-            log("✅ Cloudflare 验证通过！")
-            return True
         try:
+            if page.locator(iframe_selector).count() == 0:
+                log("✅ Cloudflare 验证界面已消失")
+                inspect_turnstile(page, "验证结束")
+                return True
+
             frame = page.frame_locator(iframe_selector)
             checkbox = frame.locator('input[type="checkbox"]')
-            if checkbox.is_visible():
-                log("🖱️ 点击验证复选框...")
-                time.sleep(random.uniform(0.5, 1.5))
-                checkbox.click()
-                log("⏳ 已点击，等待验证结果...")
-                time.sleep(5)
-            else:
-                time.sleep(1)
+
+            if not clicked:
+                try:
+                    if checkbox.is_visible(timeout=1000):
+                        log("🖱️ 检测到可见验证复选框，执行正常点击...")
+                        time.sleep(random.uniform(0.5, 1.5))
+                        checkbox.click()
+                        clicked = True
+                        log("⏳ 已点击验证，等待浏览器正常生成结果...")
+                except Exception:
+                    pass
+
+            inspect_turnstile(page, "等待中")
+
+            # 如果隐藏响应字段已有非空值，说明浏览器端已经生成 token。
+            try:
+                token_loc = page.locator(
+                    'input[name="cf-turnstile-response"], '
+                    'textarea[name="cf-turnstile-response"]'
+                )
+                for i in range(token_loc.count()):
+                    try:
+                        if len(token_loc.nth(i).input_value(timeout=500) or "") > 0:
+                            log("✅ 检测到非空 Turnstile response")
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         except Exception:
             pass
-    log("❌ 验证超时。")
+
+        time.sleep(2)
+
+    log("⚠️ Cloudflare/Turnstile 等待超时，未检测到完成状态")
+    inspect_turnstile(page, "超时")
     return False
 
 def login(page):
@@ -314,14 +381,65 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page, server_id=None):
+    renew_request_seen = False
+    renew_response_seen = False
+    renew_response_status = None
+    renew_response_location = None
+    renew_request_data = None
+
+    def on_request(request):
+        nonlocal renew_request_seen, renew_request_data
+        if request.url.endswith(f"/service/{server_id}/renew") if server_id else request.url.endswith("/renew"):
+            renew_request_seen = True
+            try:
+                renew_request_data = request.post_data or ""
+            except Exception:
+                renew_request_data = ""
+            log(f"📤 捕获续期 POST: {request.method} {request.url}")
+            # 不打印 CSRF token 本身，只打印字段和值是否为空。
+            try:
+                fields = {}
+                for part in (renew_request_data or "").split("&"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        if k == "_token":
+                            fields[k] = f"<len={len(v)}>"
+                        elif k == "cf-turnstile-response":
+                            fields[k] = f"<len={len(v)}>"
+                        else:
+                            fields[k] = v
+                log(f"🧾 /renew 表单字段摘要: {fields}")
+            except Exception:
+                pass
+
+    def on_response(response):
+        nonlocal renew_response_seen, renew_response_status, renew_response_location
+        if response.url.endswith(f"/service/{server_id}/renew") if server_id else response.url.endswith("/renew"):
+            renew_response_seen = True
+            renew_response_status = response.status
+            try:
+                renew_response_location = (
+                    response.headers.get("location")
+                    or response.headers.get("Location")
+                )
+            except Exception:
+                renew_response_location = None
+
+            log(f"📥 /renew 响应: HTTP {response.status}")
+            if renew_response_location:
+                log(f"📍 /renew 302 Location: {renew_response_location}")
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        page.wait_for_timeout(2000)
 
-        # 检查是否有限制提示
+        handle_cloudflare(page)
+        page.wait_for_timeout(3000)
+
         page_text = page.locator("body").inner_text()
         if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
             log("⚠️ 未到续期时间，无法续期。")
@@ -329,100 +447,57 @@ def renew_service(page, server_id=None):
 
         log("🖱️ 准备点击 'Renew' 按钮...")
 
-        # 仅使用真实浏览器点击，不使用 form.submit()
-        renew_btn = page.locator('button:has-text("Renew")').first
-        create_btn = page.locator('button:has-text("Create Invoice")').first
-
         modal_opened = False
 
-        # HidenCloud 页面加载较慢：
-        # - 不刷新当前页面
-        # - Renew 点击后最多等待 60 秒
-        # - 如果仍未弹出，再次点击，但继续使用当前页面
+        # 网站较慢：不刷新页面；单页最多等待 60 秒。
         for i in range(10):
             try:
                 handle_cloudflare(page)
 
-                renew_btn = page.locator('button:has-text("Renew")').first
-                renew_btn.wait_for(state="visible", timeout=30000)
+                renew_btn = page.locator('button:has-text("Renew"):visible').first
+                renew_btn.wait_for(state="visible", timeout=15000)
                 renew_btn.scroll_into_view_if_needed()
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(500)
 
                 log(f"🖱️ 第 {i + 1} 次尝试点击 'Renew'...")
                 renew_btn.click(force=True)
 
-                log("🖲️ 等待续费弹窗（网站较慢，最多60秒，不刷新页面）...")
+                create_btn = page.locator('button:has-text("Create Invoice"):visible').first
 
-                modal_wait_start = time.time()
-                create_btn = page.locator(
-                    'button:has-text("Create Invoice"):visible'
-                ).first
+                log("🖲️ 等待续费弹窗，最长 60 秒（不刷新页面）...")
+                modal_start = time.time()
 
-                while time.time() - modal_wait_start < 60:
-                    # CF 出现时处理，但不因为暂时没有 CF 就判失败
-                    if page.locator(
-                        'iframe[src*="challenges.cloudflare.com"]'
-                    ).count() > 0:
-                        log("⚠️ Renew 弹窗加载期间检测到 Cloudflare，尝试处理...")
-                        handle_cloudflare(page)
-
+                while time.time() - modal_start < 60:
                     try:
-                        if create_btn.count() > 0 and create_btn.is_visible():
+                        if create_btn.is_visible(timeout=1000):
                             modal_opened = True
                             log("✅ 续费弹窗已成功弹出！")
                             break
                     except Exception:
                         pass
 
-                    # 检查限制提示
-                    try:
-                        current_text = page.locator(
-                            "body"
-                        ).inner_text(timeout=3000)
-
-                        if (
-                            "Renewal Restricted" in current_text
-                            or "can only renew" in current_text.lower()
-                        ):
-                            log("⚠️ 未到续期时间，无法续期。")
-                            return "NOT_TIME"
-                    except Exception:
-                        pass
-
+                    # 页面可能很慢，但只继续等待，不刷新。
                     time.sleep(1)
 
                 if modal_opened:
                     break
 
-                log("⚠️ 60秒内续费弹窗仍未出现，不刷新页面。")
-
-                # 当前页面仍有 Renew 时继续点击
+                log("⚠️ 60 秒内弹窗未出现，检查 Renew 是否仍存在...")
                 try:
-                    current_renew = page.locator(
-                        'button:has-text("Renew"):visible'
-                    ).first
-
-                    if current_renew.count() > 0 and current_renew.is_visible():
-                        log("🔄 Renew 按钮仍存在，继续点击...")
-                        page.wait_for_timeout(2000)
+                    if page.locator('button:has-text("Renew"):visible').count() > 0:
+                        log("🔁 Renew 仍存在，下一次继续点击，不刷新页面")
                         continue
                 except Exception:
                     pass
 
-                log("⏳ Renew 暂时不可见，等待当前页面继续加载...")
-                page.wait_for_timeout(5000)
-
             except Exception as e:
-                log(f"❌ 第 {i + 1} 次点击 Renew 出错: {e}")
-                if i < 9:
-                    log("⏳ 网站较慢，不刷新页面，等待10秒后继续...")
-                    page.wait_for_timeout(10000)
+                log(f"⚠️ 第 {i + 1} 次 Renew 操作异常: {e}")
+                time.sleep(2)
 
         if not modal_opened:
-            log("❌ 错误：10次尝试后，续费弹窗仍未出现。")
+            log("❌ 10 次尝试后，续费弹窗仍未出现。")
             page.screenshot(path="renew_modal_failed.png")
 
-            # 连续10次失败：10分钟后重新执行
             bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             retry_time = bj_now + datetime.timedelta(minutes=10)
             log(
@@ -431,7 +506,6 @@ def renew_service(page, server_id=None):
             )
             update_cronjob_schedule(retry_time)
 
-            # 立即推送 Telegram
             send_telegram_notification(
                 "❌ 续期失败：连续10次尝试均未打开续费弹窗，已安排10分钟后重试",
                 getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知"),
@@ -439,297 +513,118 @@ def renew_service(page, server_id=None):
             )
             return "RETRY_10M"
 
-        handle_cloudflare(page)
+        # 在提交前检查一次 Turnstile 状态。
+        inspect_turnstile(page, "Create Invoice前")
 
-        # ============================================================
-        # Create Invoice：慢网站模式 + 网络请求/响应监听
-        # ============================================================
-        log("🧾 准备建立 Invoice，开始监听网络请求...")
+        create_btn = page.locator('button:has-text("Create Invoice"):visible').first
+        create_btn.wait_for(state="visible", timeout=15000)
+        create_btn.scroll_into_view_if_needed()
+        page.wait_for_timeout(1000)
 
-        invoice_candidates = []
-        invoice_responses = []
-        renew_request_seen = False
-        renew_response_seen = False
-        renew_response_status = None
+        # 只进行一次正常浏览器点击；不直接构造/提交 form。
+        log("🖱️ 点击 'Create Invoice'（仅提交一次）...")
+        create_btn.click(force=True)
 
-        def on_request(request):
-            nonlocal renew_request_seen
-            try:
-                url = request.url
-                method = request.method
+        # 给前端事件和 Turnstile 一点时间，然后持续观察网络状态。
+        log("⏳ 等待 /renew 网络请求及后续跳转，最长 150 秒...")
+        start_wait = time.time()
+        last_status = None
+        last_url = page.url
+        last_turnstile_log = 0
 
-                if "/service/" in url and "/renew" in url:
-                    renew_request_seen = True
-                    log(f"🌐 RENEW REQUEST {method} {url}")
+        while time.time() - start_wait < 150:
+            current_url = page.url
 
-                    post_data = request.post_data or ""
-                    compact = post_data[:2000].replace("\n", " ")
-                    log(f"   📤 POST DATA: {compact}")
+            if current_url != last_url:
+                log(f"🌐 页面 URL 变化: {last_url} -> {current_url}")
+                last_url = current_url
 
-                    if "cf-turnstile-response=" in post_data:
-                        m = re.search(
-                            r'cf-turnstile-response=([^&]*)',
-                            post_data
-                        )
-                        token = m.group(1) if m else ""
-                        if token:
-                            log(
-                                f"🛡️ cf-turnstile-response: 已有Token "
-                                f"(长度 {len(token)})"
-                            )
-                        else:
-                            log(
-                                "⚠️ cf-turnstile-response: 当前为空"
-                            )
+            if renew_request_seen and not renew_response_seen and last_status != "request":
+                log("📤 已发出 /renew 请求，等待服务器响应...")
+                last_status = "request"
 
-                elif re.search(
-                    r"invoice|payment|renew|create|order",
-                    url,
-                    re.I
-                ):
-                    log(f"🌐 REQUEST {method} {url}")
+            if renew_response_seen and last_status != f"response:{renew_response_status}":
+                log(f"📥 已收到 /renew 响应: HTTP {renew_response_status}")
+                if renew_response_location:
+                    log(f"📍 服务器要求跳转到: {renew_response_location}")
+                last_status = f"response:{renew_response_status}"
 
-            except Exception:
-                pass
+            # 每 10 秒打印一次 Turnstile 状态，避免刷屏。
+            if time.time() - last_turnstile_log >= 10:
+                inspect_turnstile(page, "续期等待")
+                last_turnstile_log = time.time()
 
-        def on_response(response):
-            nonlocal renew_response_seen, renew_response_status
+            # 真正的 Invoice 成功条件：URL。
+            if "/payment/invoice/" in current_url:
+                log(f"🎉 已进入发票页面: {current_url}")
+                new_invoice_url = current_url
+                break
 
-            try:
-                url = response.url
-                status = response.status
-
-                if "/service/" in url and "/renew" in url:
-                    renew_response_seen = True
-                    renew_response_status = status
-                    log(f"📥 RENEW RESPONSE {status} {url}")
-
-                    if status in (301, 302, 303, 307, 308):
-                        log(
-                            f"🔀 /renew 返回 {status}，"
-                            "继续等待浏览器导航，不立即判定失败..."
-                        )
-
-                elif re.search(
-                    r"invoice|payment|renew|create|order",
-                    url,
-                    re.I
-                ):
-                    log(f"📥 RESPONSE {status} {url}")
-
-                if "/payment/invoice/" in url:
-                    if url not in invoice_candidates:
-                        invoice_candidates.append(url)
-                        log(f"🎯 发现 Invoice URL: {url}")
-
-            except Exception:
-                pass
-
-        page.on("request", on_request)
-        page.on("response", on_response)
-
-        try:
-            log("🖱️ 点击 'Create Invoice'...")
-            create_btn = page.locator(
-                'button:has-text("Create Invoice"):visible'
-            ).first
-            create_btn.wait_for(state="visible", timeout=30000)
-            create_btn.scroll_into_view_if_needed()
-            page.wait_for_timeout(1000)
-
-            before_invoice_url = page.url
-            log(f"📍 点击前 URL: {before_invoice_url}")
-
-            create_btn.click(force=True)
-
-            # --------------------------------------------------------
-            # 第一阶段：给前端 / Turnstile / JS 足够时间
-            # --------------------------------------------------------
-            log("⏳ Create Invoice 已点击，慢网站模式等待最多 90 秒...")
-
-            phase1_start = time.time()
-
-            while time.time() - phase1_start < 90:
-                current_url = page.url
-
-                # 已经导航到 Invoice
-                if "/payment/invoice/" in current_url:
-                    if current_url not in invoice_candidates:
-                        invoice_candidates.append(current_url)
-                    log(f"🎉 已进入 Invoice 页面: {current_url}")
-                    break
-
-                # CF
-                if page.locator(
-                    'iframe[src*="challenges.cloudflare.com"]'
-                ).count() > 0:
-                    log(
-                        "⚠️ Create Invoice 期间检测到 Cloudflare，"
-                        "尝试处理..."
-                    )
-                    handle_cloudflare(page)
-
-                # /renew 已经发出
-                if renew_request_seen:
-                    log("📨 已捕获 /renew 请求，继续等待服务器响应/导航...")
-                    # 不重复点击 Create Invoice
-
-                # /renew 已响应
-                if renew_response_seen:
-                    log(
-                        f"📥 已收到 /renew 响应："
-                        f"{renew_response_status}，继续等待最终页面..."
-                    )
-
-                # 每 10 秒打印一次状态
-                elapsed = int(time.time() - phase1_start)
-                if elapsed > 0 and elapsed % 10 == 0:
-                    log(
-                        f"⏳ Invoice 等待中：{elapsed}/90秒，"
-                        f"URL={page.url}"
-                    )
-
-                time.sleep(1)
-
-            # --------------------------------------------------------
-            # 第二阶段：如果90秒后仍未跳转，再给最多60秒
-            # 但绝不重新点击 Create Invoice
-            # --------------------------------------------------------
-            if not invoice_candidates and "/payment/invoice/" not in page.url:
-                log(
-                    "⏳ 90秒后仍未进入 Invoice，"
-                    "继续等待最多60秒，不重新点击 Create Invoice..."
-                )
-
-                phase2_start = time.time()
-
-                while time.time() - phase2_start < 60:
-                    current_url = page.url
-
-                    if "/payment/invoice/" in current_url:
-                        invoice_candidates.append(current_url)
-                        log(
-                            f"🎉 延长等待期间进入 Invoice: "
-                            f"{current_url}"
-                        )
-                        break
-
-                    if page.locator(
-                        'iframe[src*="challenges.cloudflare.com"]'
-                    ).count() > 0:
-                        log("⚠️ 延长等待期间检测到 Cloudflare...")
-                        handle_cloudflare(page)
-
-                    elapsed = int(time.time() - phase2_start)
-                    if elapsed > 0 and elapsed % 15 == 0:
-                        log(
-                            f"⏳ 延长等待：{elapsed}/60秒，"
-                            f"URL={page.url}"
-                        )
-
-                    time.sleep(1)
-
-            # --------------------------------------------------------
-            # 最终确定 Invoice URL
-            # --------------------------------------------------------
-            new_invoice_url = None
-
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-
-            elif invoice_candidates:
-                for candidate in invoice_candidates:
-                    if "/payment/invoice/" in candidate:
-                        new_invoice_url = candidate
-                        break
-
-            if not new_invoice_url:
-                log("❌ 最终仍未取得 Invoice URL。")
-                log(f"📍 最终 URL: {page.url}")
-                log(
-                    f"📨 /renew 请求是否出现: {renew_request_seen}"
-                )
-                log(
-                    f"📥 /renew 响应是否出现: {renew_response_seen}"
-                )
-                log(
-                    f"📥 /renew 响应状态: {renew_response_status}"
-                )
-
-                page.screenshot(path="renew_stuck_invoice.png")
-
-                try:
-                    with open(
-                        "renew_stuck_invoice.html",
-                        "w",
-                        encoding="utf-8"
-                    ) as f:
-                        f.write(page.content())
-                    log("💾 已保存 renew_stuck_invoice.html")
-                except Exception as save_error:
-                    log(f"⚠️ 保存 HTML 失败: {save_error}")
-
+            # 如果服务器明确把请求重定向回登录页，直接失败。
+            if "/auth/login" in current_url:
+                log("❌ /renew 后被重定向到登录页，Cookie/会话可能失效。")
+                page.screenshot(path="renew_redirect_login.png")
                 return False
 
-            # --------------------------------------------------------
-            # 打开 Invoice 页面
-            # --------------------------------------------------------
-            if page.url != new_invoice_url:
-                log(f"➡️ 打开发票页面: {new_invoice_url}")
-                page.goto(
-                    new_invoice_url,
-                    wait_until="domcontentloaded",
-                    timeout=60000
-                )
+            time.sleep(1)
+        else:
+            new_invoice_url = None
 
-            log(f"🧾 当前 Invoice URL: {page.url}")
+        # 如果收到了 302 但浏览器最终仍停在 manage 页面，明确诊断。
+        if not new_invoice_url:
+            log("❌ 150 秒内未进入发票页面。")
+            log(
+                f"🔍 最终诊断: renew_request={renew_request_seen}, "
+                f"renew_response={renew_response_seen}, "
+                f"status={renew_response_status}, "
+                f"location={renew_response_location or '无'}, "
+                f"url={page.url}"
+            )
+            inspect_turnstile(page, "续期失败最终状态")
 
-            # Invoice 页面给 CF 足够时间
-            log("⏳ Invoice 页面加载中，等待 Cloudflare/页面稳定...")
-            page.wait_for_timeout(5000)
-
-            if page.locator(
-                'iframe[src*="challenges.cloudflare.com"]'
-            ).count() > 0:
-                log("⚠️ Invoice 页面检测到 Cloudflare，尝试处理...")
-                handle_cloudflare(page)
-
-            page.wait_for_timeout(3000)
-
-        finally:
+            # 输出安全的表单结构摘要，不输出 CSRF/token 内容。
             try:
-                page.remove_listener("request", on_request)
-                page.remove_listener("response", on_response)
+                form = page.locator(f'form#renew-form-{server_id}').first
+                if form.count():
+                    log(
+                        "🧾 renew-form: "
+                        f"method={form.get_attribute('method')}, "
+                        f"action={form.get_attribute('action')}"
+                    )
+                    for name in ["days", "cf-turnstile-response"]:
+                        loc = form.locator(f'[name="{name}"]')
+                        count = loc.count()
+                        if count:
+                            value_len = []
+                            for j in range(count):
+                                try:
+                                    value_len.append(
+                                        len(loc.nth(j).input_value(timeout=500) or "")
+                                    )
+                                except Exception:
+                                    value_len.append(-1)
+                            log(f"🧾 字段 {name}: count={count}, value长度={value_len}")
+                        else:
+                            log(f"🧾 字段 {name}: 不存在")
+            except Exception as e:
+                log(f"⚠️ 读取续期表单结构失败: {e}")
+
+            page.screenshot(path="renew_stuck_invoice.png")
+            try:
+                with open("renew_stuck_invoice.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                log("💾 已保存失败页面 HTML: renew_stuck_invoice.html")
             except Exception:
                 pass
 
-        # ============================================================
-        # 支付
-        # ============================================================
-        log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator(
-            'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
-        ).first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.scroll_into_view_if_needed()
-        pay_btn.click(force=True)
-        log("✅ 'Pay' 按钮已点击。")
-
-        time.sleep(5)
-
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        return True
-
-        if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
-            page.screenshot(path="renew_stuck_invoice.png")
             return False
 
         # 支付
         if page.url != new_invoice_url:
             page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
+
         handle_cloudflare(page)
+        page.wait_for_timeout(5000)
 
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator(
@@ -748,8 +643,14 @@ def renew_service(page, server_id=None):
 
     except Exception as e:
         log(f"❌ 续费异常: {e}")
-        page.screenshot(path="renew_error.png")
+        try:
+            page.screenshot(path="renew_error.png")
+        except Exception:
+            pass
         return False
+    finally:
+        page.remove_listener("request", on_request)
+        page.remove_listener("response", on_response)
 
 
 def main():
@@ -804,7 +705,7 @@ def main():
             _CURRENT_OLD_DUE = old_due
 
             # 执行续费
-            renew_result = renew_service(page)
+            renew_result = renew_service(page, server_id)
 
             new_due = old_due
             if renew_result == "RETRY_10M":
