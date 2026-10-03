@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
+from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 try:
     from patchright.sync_api import sync_playwright
 except ImportError:
@@ -13,6 +16,7 @@ EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，�
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 建议填写
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
+CRON_JOB     = os.environ.get('CRON_JOB') or ""      # cron-job.org: API_KEY,JOB_ID
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -82,6 +86,8 @@ def send_telegram_notification(status, old_due, new_due):
         f"📅 续期后到期：{new_due}\n"
         f"🕒 续期时间：{now}"
     )
+    if CRON_NEXT_RUN_TEXT:
+        text += f"\n⏰ 下次任务：{CRON_NEXT_RUN_TEXT}"
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
@@ -99,6 +105,132 @@ def send_telegram_notification(status, old_due, new_due):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
+# =========================================================
+# cron-job.org 写回
+# CRON_JOB 格式：API_KEY,JOB_ID
+# 成功续期后：下一次执行安排在成功时间 + 7 天的 17:00~23:59（Asia/Shanghai）
+# 使用 expiresAt 让该任务只执行这一次，避免按月/年重复执行。
+# =========================================================
+CRON_API_BASE = "https://api.cron-job.org"
+CRON_TIMEZONE = "Asia/Shanghai"
+CRON_NEXT_RUN_TEXT = ""
+
+
+def parse_cron_job(value):
+    if not value:
+        return None, None
+    parts = [x.strip() for x in value.split(",", 1)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        log("⚠️ CRON_JOB 格式错误，应为 API_KEY,JOB_ID")
+        return None, None
+    return parts[0], parts[1]
+
+
+def _cron_response_text(resp):
+    try:
+        data = resp.json()
+        return str(data)
+    except Exception:
+        return (resp.text or "")[:500]
+
+
+def update_cron_job_after_success(success_time=None):
+    """续期成功后把 cron-job.org 改到下一次续期时间。"""
+    global CRON_NEXT_RUN_TEXT
+    api_key, job_id = parse_cron_job(CRON_JOB)
+    if not api_key or not job_id:
+        log("⚠️ 未配置 CRON_JOB，跳过 cron-job.org 写回")
+        return None
+
+    tz = ZoneInfo(CRON_TIMEZONE)
+    now = success_time.astimezone(tz) if success_time else datetime.now(tz)
+
+    # 按既有策略：成功后第 7 天，17:00~23:59 随机。
+    target_date = (now + timedelta(days=7)).date()
+    hour = random.randint(17, 23)
+    minute = random.randint(0, 59)
+    next_run = datetime(
+        target_date.year, target_date.month, target_date.day,
+        hour, minute, 0, tzinfo=tz
+    )
+
+    # expiresAt 稍晚于计划时间，使这个“单日计划”执行一次后自动失效。
+    expires_at = next_run + timedelta(hours=1)
+    expires_str = expires_at.strftime("%Y%m%d%H%M%S")
+
+    payload = {
+        "job": {
+            "enabled": True,
+            "schedule": {
+                "timezone": CRON_TIMEZONE,
+                "expiresAt": int(expires_str),
+                "hours": [hour],
+                "mdays": [target_date.day],
+                "minutes": [minute],
+                "months": [target_date.month],
+                "wdays": [-1]
+            }
+        }
+    }
+
+    url = f"{CRON_API_BASE}/jobs/{job_id}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "HidenCloud-Renew/1.0"
+    }
+
+    CRON_NEXT_RUN_TEXT = next_run.strftime("%Y-%m-%d %H:%M:%S") + f" ({CRON_TIMEZONE})"
+    log(f"⏰ 准备写回 cron-job.org")
+    log(f"📅 下次续期时间：{CRON_NEXT_RUN_TEXT}")
+    log(f"🆔 Cron Job ID：{job_id}")
+
+    # 最多 3 次；429 优先遵循 Retry-After。
+    for attempt in range(1, 4):
+        try:
+            resp = requests.patch(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=20,
+                proxies=REQUESTS_PROXIES
+            )
+
+            if resp.status_code in (200, 204):
+                log("✅ cron-job.org 写回成功")
+                log(f"⏰ 下次运行：{CRON_NEXT_RUN_TEXT}")
+                return True
+
+            body = _cron_response_text(resp)
+            log(f"⚠️ Cron 写回第{attempt}次失败：HTTP {resp.status_code}: {body}")
+
+            if attempt >= 3:
+                break
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After", "")
+                try:
+                    wait_sec = max(1, int(float(retry_after)))
+                except Exception:
+                    wait_sec = 15 * attempt
+                wait_sec = min(wait_sec, 60)
+                log(f"⏳ 429，等待 {wait_sec} 秒后重试...")
+            else:
+                wait_sec = 15 * attempt
+                log(f"⏳ 等待 {wait_sec} 秒后重试...")
+            time.sleep(wait_sec)
+
+        except Exception as e:
+            log(f"⚠️ Cron 写回第{attempt}次异常：{e}")
+            if attempt < 3:
+                wait_sec = 15 * attempt
+                log(f"⏳ 等待 {wait_sec} 秒后重试...")
+                time.sleep(wait_sec)
+
+    log("❌ cron-job.org 写回最终失败")
+    return False
+
 
 # =========================================================
 # Cloudflare Turnstile 处理
@@ -782,9 +914,13 @@ def main():
             log(f"📆 续费前到期时间：{old_due}")
 
             # 执行续费
+            success_time = datetime.now(ZoneInfo(CRON_TIMEZONE))
             renew_result = renew_service(page)
 
             new_due = old_due
+            cron_result = None
+            verified_success = False
+
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
                 status = "⏳ 未到续期时间"
@@ -794,7 +930,31 @@ def main():
             else:  # renew_result is True
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
-                status = "✅ 续期成功"
+
+                # 最终成功判定：Due Date 必须实际增加 7 天。
+                try:
+                    old_dt = datetime.strptime(old_due, "%d %b %Y")
+                    new_dt = datetime.strptime(new_due, "%d %b %Y")
+                    delta_days = (new_dt - old_dt).days
+                    log(f"🔎 Due Date 实际变化：{delta_days} 天")
+                    verified_success = (delta_days == 7)
+                except Exception as e:
+                    log(f"⚠️ 无法计算 Due Date 变化：{e}")
+                    verified_success = False
+
+                if verified_success:
+                    status = "✅ 续期成功"
+                    log("✅ 已确认 Due Date 实际增加 7 天")
+                    cron_result = update_cron_job_after_success(success_time)
+                    if cron_result is True:
+                        status += "\n⏰ Cron 已更新"
+                    elif cron_result is False:
+                        status += "\n⚠️ Cron 更新失败"
+                    else:
+                        status += "\nℹ️ 未配置 Cron"
+                else:
+                    status = "❌ 续期结果未确认"
+                    log("❌ Due Date 没有确认增加 7 天，因此不会修改 cron-job")
 
             # 发送 Telegram 通知
             send_telegram_notification(status, old_due, new_due)
@@ -802,6 +962,11 @@ def main():
             if renew_result == "NOT_TIME":
                 sys.exit(0)
             elif renew_result is False:
+                sys.exit(1)
+            elif not verified_success:
+                sys.exit(1)
+            elif cron_result is False:
+                # 续期本身成功，但 Cron 写回失败；让 GitHub Actions 明确标红，避免悄悄错过下次任务。
                 sys.exit(1)
             else:
                 sys.exit(0)
