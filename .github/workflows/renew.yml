@@ -21,6 +21,16 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
+      - name: 📥 下载私库 app.py
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/Auto-Renew-HidenCloud-Private
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private
+
+      - name: 📂 复制私库 app.py 到工作目录
+        run: cp private/app.py app.py
+
 
       - name: ⚙ 设置 Python
         uses: actions/setup-python@v6
@@ -43,6 +53,7 @@ jobs:
 
       - name: 🚀 运行续期脚本
         env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
