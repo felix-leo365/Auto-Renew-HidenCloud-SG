@@ -40,16 +40,137 @@ jobs:
       - name: 🛠️ 安装系统依赖和python依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb curl wget
           pip install patchright requests 'requests[socks]' pynacl
           python -m patchright install --with-deps chrome
 
       - name: ⚙ 设置sing-box代理
-        continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          set +e
+
+          notify_proxy_failure() {
+            local reason="$1"
+            echo "❌ 代理初始化失败：${reason}"
+
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              curl --noproxy '*' -sS --max-time 15 \
+                -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=🚨 HidenCloud 自动续期失败
+
+          原因：sing-box 代理初始化失败
+          详情：${reason}
+
+          已中断工作流，未执行续期操作。" \
+                >/dev/null || echo "⚠️ Telegram 故障通知发送失败"
+            else
+              echo "⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，无法发送通知"
+            fi
+          }
+
+          if [ -z "$NODE_LINK" ]; then
+            notify_proxy_failure "NODE_LINK 未配置"
+            exit 1
+          fi
+
+          echo "[INFO] 下载远端 sing-box 代理脚本..."
+          if ! wget -qO /tmp/setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh; then
+            notify_proxy_failure "下载 setup_proxy.sh 失败"
+            exit 1
+          fi
+
+          # 不修改远端文件：仅修补本次 Actions 下载到本地的临时副本
+          echo "[INFO] 修补本地副本中的 sing-box 版本查询..."
+          python - <<'PY'
+          from pathlib import Path
+
+          script = Path("/tmp/setup_proxy.sh")
+          content = script.read_text(encoding="utf-8", errors="replace")
+          target = 'latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r \'[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")\')'
+
+          replacement = r'''# GitHub API 可能返回错误对象而不是 releases 数组；安全处理并回退备用版本
+          latest_version=""
+          for api_attempt in 1 2 3; do
+            api_response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/SagerNet/sing-box/releases" 2>/dev/null || true)"
+
+            if [ -n "$api_response" ]; then
+              latest_version="$(printf '%s' "$api_response" | jq -r '
+                if type == "array" then
+                  ([.[] | select(type == "object" and .prerelease == false)
+                    | .tag_name | select(type == "string" and length > 0)][0] // "")
+                else
+                  ""
+                end
+              ' 2>/dev/null | sed 's/^v//' || true)"
+            fi
+
+            [ -n "$latest_version" ] && break
+            echo "[WARN] sing-box 版本接口异常（${api_attempt}/3）"
+            [ "$api_attempt" -lt 3 ] && sleep 5
+          done
+
+          if [ -z "$latest_version" ]; then
+            echo "[WARN] GitHub API 无法返回有效版本，使用备用版本 v1.13.16"
+            latest_version="1.13.16"
+          fi'''
+
+          if content.count(target) != 1:
+              raise SystemExit(
+                  "未能唯一定位远端脚本中的版本查询语句；为避免误改，停止执行。"
+              )
+
+          script.write_text(content.replace(target, replacement), encoding="utf-8")
+          print("已修补临时脚本：版本 API 异常时重试并回退 v1.13.16")
+          PY
+          if [ "$?" -ne 0 ]; then
+            notify_proxy_failure "无法修补下载到本地的 setup_proxy.sh，已停止"
+            exit 1
+          fi
+
+          echo "[INFO] 执行已修补的本地 sing-box 代理脚本..."
+          max_attempts=3
+          retry_delay=10
+          proxy_status=1
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "[INFO] sing-box 代理初始化：第 ${attempt}/${max_attempts} 次尝试"
+
+            bash /tmp/setup_proxy.sh
+            proxy_status=$?
+
+            if [ "$proxy_status" -eq 0 ]; then
+              echo "[INFO] setup_proxy.sh 执行成功"
+              break
+            fi
+
+            echo "[WARN] setup_proxy.sh 执行失败，退出码：${proxy_status}"
+
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "[INFO] ${retry_delay} 秒后重试..."
+              sleep "$retry_delay"
+            fi
+          done
+
+          if [ "$proxy_status" -ne 0 ]; then
+            notify_proxy_failure "setup_proxy.sh 连续 ${max_attempts} 次执行失败，最后退出码：${proxy_status}"
+            exit 1
+          fi
+
+          # 确认远端脚本已将代理成功标记写入 GitHub Actions 环境
+          if ! grep -q '^IS_PROXY=true$' "$GITHUB_ENV" || \
+             ! grep -Eq '^PROXY_SERVER=.+$' "$GITHUB_ENV"; then
+            notify_proxy_failure "脚本未写入有效的 IS_PROXY=true 和 PROXY_SERVER，代理未确认启用"
+            exit 1
+          fi
+
+          echo "✅ sing-box 代理初始化成功，允许继续执行续期脚本"
 
       - name: 🚀 运行续期脚本
         env:
