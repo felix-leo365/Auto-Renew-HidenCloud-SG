@@ -44,28 +44,22 @@ jobs:
           pip install patchright requests 'requests[socks]' pynacl
           python -m patchright install --with-deps chrome
 
-      - name: ⚙ 设置sing-box代理
+      - name: ⚙ 设置 GOST 代理
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          set +e
+          set -euo pipefail
 
           notify_proxy_failure() {
             local reason="$1"
-            echo "❌ 代理初始化失败：${reason}"
-
+            echo "❌ GOST 代理初始化失败：${reason}"
             if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
               curl --noproxy '*' -sS --max-time 15 \
                 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                 --data-urlencode "chat_id=${TG_CHAT_ID}" \
-                --data-urlencode "text=🚨 HidenCloud 自动续期失败
-
-          原因：sing-box 代理初始化失败
-          详情：${reason}
-
-          已中断工作流，未执行续期操作。" \
+                --data-urlencode "text=🚨 HidenCloud 自动续期失败\n\n原因：GOST 代理初始化失败\n详情：${reason}\n\n已中断工作流，未执行续期操作。" \
                 >/dev/null || echo "⚠️ Telegram 故障通知发送失败"
             else
               echo "⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，无法发送通知"
@@ -77,100 +71,63 @@ jobs:
             exit 1
           fi
 
-          echo "[INFO] 下载远端 sing-box 代理脚本..."
-          if ! wget -qO /tmp/setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh; then
-            notify_proxy_failure "下载 setup_proxy.sh 失败"
+          echo "[INFO] 下载 GOST..."
+          api_response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+            https://api.github.com/repos/ginuerzh/gost/releases/latest || true)"
+          VERSION="$(printf '%s' "$api_response" | jq -r 'if type == "object" then (.tag_name // "") else "" end' | sed 's/^v//')"
+
+          if [ -z "$VERSION" ]; then
+            notify_proxy_failure "无法从 GitHub Releases 获取有效的 GOST 版本"
             exit 1
           fi
 
-          # 不修改远端文件：仅修补本次 Actions 下载到本地的临时副本
-          echo "[INFO] 修补本地副本中的 sing-box 版本查询..."
-          python - <<'PY'
-          from pathlib import Path
+          echo "📦 GOST 版本: $VERSION"
+          archive="gost_${VERSION}_linux_amd64.tar.gz"
+          if ! wget -q --timeout=30 "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/${archive}"; then
+            notify_proxy_failure "下载 GOST ${VERSION} 失败"
+            exit 1
+          fi
 
-          script = Path("/tmp/setup_proxy.sh")
-          content = script.read_text(encoding="utf-8", errors="replace")
-          target = 'latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r \'[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")\')'
+          if ! tar -xzf "$archive"; then
+            notify_proxy_failure "解压 GOST 失败"
+            exit 1
+          fi
+          if [ ! -f gost ]; then
+            notify_proxy_failure "解压后未找到 GOST 可执行文件"
+            exit 1
+          fi
 
-          replacement = r'''# GitHub API 可能返回错误对象而不是 releases 数组；安全处理并回退备用版本
-          latest_version=""
-          for api_attempt in 1 2 3; do
-            api_response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/SagerNet/sing-box/releases" 2>/dev/null || true)"
+          chmod +x gost
+          nohup ./gost -L http://127.0.0.1:8080 -F "$NODE_LINK" > gost.log 2>&1 &
+          GOST_PID=$!
+          echo "$GOST_PID" > /tmp/gost.pid
 
-            if [ -n "$api_response" ]; then
-              latest_version="$(printf '%s' "$api_response" | jq -r '
-                if type == "array" then
-                  ([.[] | select(type == "object" and .prerelease == false)
-                    | .tag_name | select(type == "string" and length > 0)][0] // "")
-                else
-                  ""
-                end
-              ' 2>/dev/null | sed 's/^v//' || true)"
+          echo "[INFO] 等待 GOST 启动并验证代理出口..."
+          proxy_ok=0
+          for attempt in $(seq 1 10); do
+            if curl -fsS --max-time 10 -x http://127.0.0.1:8080 https://api.ipify.org >/tmp/proxy_ip.txt; then
+              proxy_ip="$(cat /tmp/proxy_ip.txt)"
+              if [ -n "$proxy_ip" ]; then
+                echo "✅ GOST 代理测试成功，出口 IP: $proxy_ip"
+                proxy_ok=1
+                break
+              fi
             fi
-
-            [ -n "$latest_version" ] && break
-            echo "[WARN] sing-box 版本接口异常（${api_attempt}/3）"
-            [ "$api_attempt" -lt 3 ] && sleep 5
+            sleep 3
           done
 
-          if [ -z "$latest_version" ]; then
-            echo "[WARN] GitHub API 无法返回有效版本，使用备用版本 v1.13.16"
-            latest_version="1.13.16"
-          fi'''
-
-          if content.count(target) != 1:
-              raise SystemExit(
-                  "未能唯一定位远端脚本中的版本查询语句；为避免误改，停止执行。"
-              )
-
-          script.write_text(content.replace(target, replacement), encoding="utf-8")
-          print("已修补临时脚本：版本 API 异常时重试并回退 v1.13.16")
-          PY
-          if [ "$?" -ne 0 ]; then
-            notify_proxy_failure "无法修补下载到本地的 setup_proxy.sh，已停止"
+          if [ "$proxy_ok" -ne 1 ]; then
+            notify_proxy_failure "本地 HTTP 代理 127.0.0.1:8080 连通性测试失败"
             exit 1
           fi
 
-          echo "[INFO] 执行已修补的本地 sing-box 代理脚本..."
-          max_attempts=3
-          retry_delay=10
-          proxy_status=1
+          # 将代理状态写入 GitHub Actions 环境，续期程序只能使用该代理
+          {
+            echo "IS_PROXY=true"
+            echo "PROXY_SERVER=http://127.0.0.1:8080"
+          } >> "$GITHUB_ENV"
 
-          for attempt in $(seq 1 "$max_attempts"); do
-            echo "[INFO] sing-box 代理初始化：第 ${attempt}/${max_attempts} 次尝试"
-
-            bash /tmp/setup_proxy.sh
-            proxy_status=$?
-
-            if [ "$proxy_status" -eq 0 ]; then
-              echo "[INFO] setup_proxy.sh 执行成功"
-              break
-            fi
-
-            echo "[WARN] setup_proxy.sh 执行失败，退出码：${proxy_status}"
-
-            if [ "$attempt" -lt "$max_attempts" ]; then
-              echo "[INFO] ${retry_delay} 秒后重试..."
-              sleep "$retry_delay"
-            fi
-          done
-
-          if [ "$proxy_status" -ne 0 ]; then
-            notify_proxy_failure "setup_proxy.sh 连续 ${max_attempts} 次执行失败，最后退出码：${proxy_status}"
-            exit 1
-          fi
-
-          # 确认远端脚本已将代理成功标记写入 GitHub Actions 环境
-          if ! grep -q '^IS_PROXY=true$' "$GITHUB_ENV" || \
-             ! grep -Eq '^PROXY_SERVER=.+$' "$GITHUB_ENV"; then
-            notify_proxy_failure "脚本未写入有效的 IS_PROXY=true 和 PROXY_SERVER，代理未确认启用"
-            exit 1
-          fi
-
-          echo "✅ sing-box 代理初始化成功，允许继续执行续期脚本"
+          echo "✅ GOST 已验证，代理环境已设置"
 
       - name: 🚀 运行续期脚本
         env:
@@ -185,20 +142,43 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      # 更新时间到time.txt,避免6个月未更新导致工作流暂停；处理远程并发提交
       - name: 🕒 更新时间
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
-          git add time.txt
-          if git diff --cached --quiet; then
-            echo "No need to commit"
-          else
-            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-            git push origin main
-          fi
+
+          timestamp="$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+          for attempt in $(seq 1 5); do
+            echo "🔄 推送尝试 ${attempt}/5"
+            git fetch origin main
+            git reset --hard origin/main
+            echo "$timestamp" > time.txt
+            git add time.txt
+            git commit -m "⏱️ Auto Update by Github Actions $timestamp" || {
+              echo "ℹ️ time.txt 无变更，跳过提交"
+              exit 0
+            }
+            if git push origin main; then
+              echo "✅ time.txt 更新成功"
+              exit 0
+            fi
+            echo "⚠️ 推送失败，准备重试..."
+            sleep 2
+          done
+          echo "❌ 重试5次后仍无法推送"
+          exit 1
       
+      - name: 🧽 清理 GOST 和临时文件
+        if: always()
+        run: |
+          if [ -f /tmp/gost.pid ]; then
+            kill "$(cat /tmp/gost.pid)" 2>/dev/null || true
+          fi
+          pkill -f "./gost -L" 2>/dev/null || true
+          rm -f gost gost_*.tar.gz gost.log /tmp/gost.pid /tmp/proxy_ip.txt
+
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
